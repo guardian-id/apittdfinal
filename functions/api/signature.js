@@ -4,16 +4,15 @@ const ALLOWED_ORIGIN = "https://tandatangansuratpesanan.pages.dev";
 const GUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const PNG_DATA_URL_PREFIX = "data:image/png;base64,iVBORw0KGgo";
-const PNG_DATA_URL_REGEX = /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/;
+// Base64 murni PNG tanpa prefix data:image/png;base64,
+const PNG_BASE64_PREFIX = "iVBORw0KGgo";
+const PNG_BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const MAX_SIGNATURE_LENGTH = 3000000;
 const MAX_BODY_LENGTH = MAX_SIGNATURE_LENGTH + 10000;
 const PA_TIMEOUT_MS = 20000;
 
-// Penanda reservasi permanen selama pengiriman atau saat hasil tidak pasti.
-// Status tabel tetap ACTIVE, USED, atau REVOKED.
-// Reservasi hanya dilepas setelah penolakan pasti dari Power Automate.
+// Penanda reservasi. Status D1 tetap ACTIVE, USED, atau REVOKED.
 const RESERVATION_MARKER = "9999-12-31T23:59:59.999Z";
 
 function json(data, status = 200) {
@@ -46,11 +45,12 @@ function parseDbTime(value) {
   return Date.parse(text);
 }
 
+// 4xx selain 408 dianggap penolakan pasti.
+// 408, 5xx, timeout, dan gangguan jaringan dianggap tidak pasti.
 function isDefiniteRejection(status) {
   return status >= 400 && status < 500 && status !== 408;
 }
 
-// Lepas reservasi hanya jika Power Automate menolak dengan pasti.
 async function releaseReservation(env, guid) {
   return env.DB.prepare(`
     UPDATE signing_tokens
@@ -89,9 +89,13 @@ export async function onRequestPost({ request, env }) {
     }, 500);
   }
 
+  // Batasi ukuran request sebelum parsing JSON.
   const declaredLength = Number(request.headers.get("Content-Length"));
 
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_LENGTH) {
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > MAX_BODY_LENGTH
+  ) {
     return json({
       success: false,
       message: "Ukuran data terlalu besar."
@@ -127,27 +131,50 @@ export async function onRequestPost({ request, env }) {
     }, 400);
   }
 
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
     return json({
       success: false,
       message: "Request JSON tidak valid."
     }, 400);
   }
 
-  const guid = typeof body.guid === "string" ? body.guid.trim() : "";
-  const store = typeof body.store === "string" ? body.store.trim() : "";
-  const docNumber =
-    typeof body.docNumber === "string" ? body.docNumber.trim() : "";
-  const signature =
-    typeof body.signature === "string" ? body.signature : "";
+  const guid =
+    typeof body.guid === "string" ? body.guid.trim() : "";
 
+  const store =
+    typeof body.store === "string" ? body.store.trim() : "";
+
+  const docNumber =
+    typeof body.docNumber === "string"
+      ? body.docNumber.trim()
+      : "";
+
+  const signatureInput =
+    typeof body.signature === "string"
+      ? body.signature
+      : "";
+
+  // Mendukung input frontend dalam format data URL maupun Base64 murni.
+  // Prefix dihapus hanya jika memang ada di awal string.
+  const dataUrlPrefix = "data:image/png;base64,";
+
+  const signature = signatureInput.startsWith(dataUrlPrefix)
+    ? signatureInput.slice(dataUrlPrefix.length)
+    : signatureInput;
+
+  // Validasi format PNG Base64.
   if (
     !GUID_REGEX.test(guid) ||
     !store ||
     !docNumber ||
     signature.length > MAX_SIGNATURE_LENGTH ||
-    !signature.startsWith(PNG_DATA_URL_PREFIX) ||
-    !PNG_DATA_URL_REGEX.test(signature)
+    !signature.startsWith(PNG_BASE64_PREFIX) ||
+    !PNG_BASE64_REGEX.test(signature) ||
+    signature.length % 4 !== 0
   ) {
     return json({
       success: false,
@@ -160,8 +187,14 @@ export async function onRequestPost({ request, env }) {
 
   try {
     const token = await env.DB.prepare(`
-      SELECT guid, store, doc_number, expires_at, status,
-             locked_until, attempt_count
+      SELECT
+        guid,
+        store,
+        doc_number,
+        expires_at,
+        status,
+        locked_until,
+        attempt_count
       FROM signing_tokens
       WHERE guid = ?
       LIMIT 1
@@ -177,7 +210,10 @@ export async function onRequestPost({ request, env }) {
     const now = Date.now();
     const expiresAtMs = parseDbTime(token.expires_at);
 
-    if (!Number.isFinite(expiresAtMs) || now >= expiresAtMs) {
+    if (
+      !Number.isFinite(expiresAtMs) ||
+      now >= expiresAtMs
+    ) {
       return json({
         success: false,
         message: "Link sudah kedaluwarsa."
@@ -191,8 +227,8 @@ export async function onRequestPost({ request, env }) {
       }, 410);
     }
 
-    // Penanda ini berarti pengiriman sedang berjalan atau hasilnya
-    // tidak dapat dipastikan. Jangan pernah mengirim ulang otomatis.
+    // Pengiriman sedang berlangsung atau hasil sebelumnya tidak pasti.
+    // Jangan kirim ulang secara otomatis.
     if (token.locked_until === RESERVATION_MARKER) {
       return json({
         success: false,
@@ -202,11 +238,14 @@ export async function onRequestPost({ request, env }) {
       }, 409);
     }
 
-    // Menghormati penguncian sementara dari data atau versi sebelumnya.
+    // Periksa penguncian sementara biasa.
     if (token.locked_until) {
       const lockedUntilMs = parseDbTime(token.locked_until);
 
-      if (Number.isFinite(lockedUntilMs) && lockedUntilMs > now) {
+      if (
+        Number.isFinite(lockedUntilMs) &&
+        lockedUntilMs > now
+      ) {
         return json({
           success: false,
           message: "Link dikunci sementara."
@@ -214,18 +253,23 @@ export async function onRequestPost({ request, env }) {
       }
     }
 
-    if (token.store !== store || token.doc_number !== docNumber) {
+    // Pastikan toko dan dokumen cocok dengan token di D1.
+    if (
+      token.store !== store ||
+      token.doc_number !== docNumber
+    ) {
       return json({
         success: false,
-        message: "Data toko atau dokumen tidak cocok dengan link."
+        message:
+          "Data toko atau dokumen tidak cocok dengan link."
       }, 403);
     }
 
     const nowIso = new Date(now).toISOString();
 
     // Reservasi atomik menggunakan locked_until.
-    // Tidak menggunakan status SENDING karena status tersebut
-    // tidak diizinkan oleh CHECK constraint tabel D1.
+    // Tidak menggunakan status SENDING karena CHECK constraint D1
+    // hanya mengizinkan ACTIVE, USED, dan REVOKED.
     const lock = await env.DB.prepare(`
       UPDATE signing_tokens
       SET locked_until = ?
@@ -246,7 +290,8 @@ export async function onRequestPost({ request, env }) {
     if (!lock.meta || lock.meta.changes !== 1) {
       return json({
         success: false,
-        message: "Link sedang diproses atau sudah tidak aktif."
+        message:
+          "Link sedang diproses atau sudah tidak aktif."
       }, 409);
     }
 
@@ -263,7 +308,8 @@ export async function onRequestPost({ request, env }) {
           "X-Idempotency-Key": guid
         },
 
-        // PENTING: FORMAT JSON POWER AUTOMATE TETAP SAMA.
+        // FORMAT JSON POWER AUTOMATE TIDAK BERUBAH.
+        // signature sekarang berisi Base64 murni tanpa prefix data URL.
         body: JSON.stringify({
           store,
           docNumber,
@@ -273,8 +319,8 @@ export async function onRequestPost({ request, env }) {
         signal: AbortSignal.timeout(PA_TIMEOUT_MS)
       });
     } catch (error) {
-      // Timeout atau gangguan jaringan: Power Automate mungkin
-      // sudah menerima request. Reservasi tetap dipertahankan.
+      // Timeout/jaringan gagal: PA mungkin sudah menerima request.
+      // Pertahankan reservasi agar tidak terjadi pengiriman ulang.
       console.error(
         "signature: request Power Automate gagal atau timeout:",
         guid,
@@ -291,9 +337,22 @@ export async function onRequestPost({ request, env }) {
 
     if (!paResponse.ok) {
       if (isDefiniteRejection(paResponse.status)) {
-        // Hanya penolakan pasti yang membolehkan percobaan kembali.
-        await releaseReservation(env, guid);
-        reserved = false;
+        // Lepaskan reservasi hanya setelah penolakan pasti.
+        try {
+          const released = await releaseReservation(env, guid);
+
+          reserved =
+            !released.meta || released.meta.changes !== 1;
+        } catch (error) {
+          // Jika gagal melepas reservasi, biarkan token terkunci.
+          reserved = true;
+
+          console.error(
+            "signature: gagal melepas reservasi:",
+            guid,
+            error
+          );
+        }
 
         return json({
           success: false,
@@ -302,7 +361,8 @@ export async function onRequestPost({ request, env }) {
         }, 502);
       }
 
-      // HTTP 408 dan 5xx: jangan lepas reservasi.
+      // HTTP 408 atau 5xx: hasil pengiriman tidak pasti.
+      // Reservasi tetap dipertahankan.
       console.error(
         "signature: status Power Automate tidak pasti:",
         guid,
@@ -318,8 +378,6 @@ export async function onRequestPost({ request, env }) {
     }
 
     // Power Automate membalas sukses: tandai token USED.
-    // Jika pembaruan gagal, reservasi tetap terkunci agar request
-    // yang sama tidak dikirim ulang.
     let marked = false;
 
     for (let attempt = 0; attempt < 2 && !marked; attempt++) {
@@ -332,9 +390,14 @@ export async function onRequestPost({ request, env }) {
           WHERE guid = ?
             AND status = 'ACTIVE'
             AND locked_until = ?
-        `).bind(guid, RESERVATION_MARKER).run();
+        `).bind(
+          guid,
+          RESERVATION_MARKER
+        ).run();
 
-        marked = Boolean(used.meta) && used.meta.changes === 1;
+        marked =
+          Boolean(used.meta) &&
+          used.meta.changes === 1;
       } catch (error) {
         console.error(
           "signature: gagal menandai USED, percobaan " +
@@ -346,8 +409,10 @@ export async function onRequestPost({ request, env }) {
     }
 
     if (!marked) {
+      // PA sudah menerima. Jangan lepaskan reservasi jika status
+      // D1 gagal diperbarui; administrator perlu memeriksanya.
       console.error(
-        "signature: Power Automate membalas sukses tetapi status D1 belum USED. Perlu pemeriksaan administrator:",
+        "signature: PA sukses tetapi token belum berstatus USED. Perlu pemeriksaan administrator:",
         guid
       );
     }
@@ -359,10 +424,14 @@ export async function onRequestPost({ request, env }) {
       message: "Tanda tangan berhasil dikirim."
     });
   } catch (error) {
-    console.error("signature: kesalahan server:", guid, error);
+    console.error(
+      "signature: kesalahan server:",
+      guid,
+      error
+    );
 
-    // Reservasi hanya dilepas jika error terjadi sebelum request
-    // ke Power Automate dimulai.
+    // Reservasi hanya boleh dilepas jika pengiriman ke PA
+    // belum dimulai.
     if (reserved && !sendStarted) {
       try {
         await releaseReservation(env, guid);
@@ -377,7 +446,8 @@ export async function onRequestPost({ request, env }) {
 
     return json({
       success: false,
-      message: "Terjadi kesalahan server saat mengirim tanda tangan."
+      message:
+        "Terjadi kesalahan server saat mengirim tanda tangan."
     }, 500);
   }
 }
